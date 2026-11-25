@@ -270,7 +270,8 @@ bool Stream::fits(unsigned rate, Speed speed) const noexcept {
         return false;
     if (protocol == Protocol::uac2)
         return true; // The rate comes from the live Clock Source.
-    if (!data.sampleRateControl)
+    // An adaptive OUT endpoint can recover its clock from the host stream.
+    if (!data.sampleRateControl && (data.isInput() || data.synchronization != 2u))
         return (rates.size() == 1 && rates.front() == rate) || (minRate == rate && maxRate == rate);
     return std::find(rates.begin(), rates.end(), rate) != rates.end() ||
            (minRate != 0 && rate >= minRate && rate <= maxRate);

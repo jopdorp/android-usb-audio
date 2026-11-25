@@ -46,14 +46,17 @@ void append(Config& config, std::initializer_list<std::uint8_t> descriptor) {
     config[3] = static_cast<std::uint8_t>(config.size() >> 8u);
 }
 
-Config uac1() {
+Config uac1(bool multiplePlaybackRates = false) {
     Config config{9, 2, 9, 0, 3, 1, 0, 0x80, 50};
     append(config, {9, 4, 0, 0, 0, 1, 1, 0, 0});
     append(config, {10, 0x24, 1, 0, 1, 10, 0, 2, 1, 2});
     append(config, {9, 4, 1, 0, 0, 1, 2, 0, 0});
     append(config, {9, 4, 1, 1, 1, 1, 2, 0, 0});
     append(config, {7, 0x24, 1, 1, 1, 1, 0});
-    append(config, {11, 0x24, 2, 1, 2, 2, 16, 1, 0x80, 0xbb, 0});
+    if (multiplePlaybackRates)
+        append(config, {14, 0x24, 2, 1, 2, 2, 16, 2, 0x44, 0xac, 0, 0x80, 0xbb, 0});
+    else
+        append(config, {11, 0x24, 2, 1, 2, 2, 16, 1, 0x80, 0xbb, 0});
     append(config, {9, 5, 0x01, 9, 192, 0, 1, 0, 0});
     append(config, {7, 0x25, 1, 0, 0, 0, 0});
     append(config, {9, 4, 2, 0, 0, 1, 2, 0, 0});
@@ -108,6 +111,13 @@ void testDescriptors() {
           "UAC1 range and endpoint rate control");
     check(fs->controlFor(playback) == fs->controlFor(capture) && fs->controlFor(capture) != nullptr,
           "UAC1 AudioControl ownership");
+
+    const auto adaptive = parseConfiguration(uac1(true), Speed::full);
+    check(adaptive && adaptive->streams.size() == 2, "Multirate UAC1 duplex descriptors");
+    const auto& adaptiveOut = adaptive->streams[0];
+    check(!adaptiveOut.data.sampleRateControl && adaptiveOut.fits(44100, Speed::full) &&
+          adaptiveOut.fits(48000, Speed::full) && !adaptiveOut.fits(32000, Speed::full),
+          "Adaptive playback can track its advertised rates without sample-rate control");
 
     const auto hs = parseConfiguration(findConfiguration(raw, 2), Speed::high);
     check(hs && hs->streams.size() == 2, "UAC2 duplex descriptors");
