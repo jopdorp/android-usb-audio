@@ -92,15 +92,16 @@ public:
 
     unsigned size() const noexcept { return size_; }
 
-    unsigned pop(float* dst, unsigned frames) noexcept {
-        const auto available = std::min(frames, size_);
-        const auto first = std::min(available, capacity_ - read_);
+    void discard(unsigned frames) noexcept {
+        read_ = (read_ + frames) % capacity_;
+        size_ -= frames;
+    }
+
+    void pop(float* dst, unsigned frames) noexcept {
+        const auto first = std::min(frames, capacity_ - read_);
         std::copy_n(samples_.data() + read_ * channels_, first * channels_, dst);
-        std::copy_n(samples_.data(), (available - first) * channels_, dst + first * channels_);
-        std::fill_n(dst + available * channels_, (frames - available) * channels_, 0.0f);
-        read_ = (read_ + available) % capacity_;
-        size_ -= available;
-        return available;
+        std::copy_n(samples_.data(), (frames - first) * channels_, dst + first * channels_);
+        discard(frames);
     }
 
 private:
@@ -115,10 +116,13 @@ struct Streaming {
     Streaming(const Stream& output, const std::optional<Stream>& input,
               Speed speed, unsigned rate, unsigned block, AudioCallback callback, void* context)
         : callback(callback), context(context), blockFrames(block), outputCursor(block),
-          inputPreroll(input ? block + std::max(rate / 1000u,
+          fadeFrames(std::max(1u, rate / 1500u)),
+          inputPreroll(input ? block + streamQueueDepth * std::max(rate / 1000u,
               rate * input->data.intervalTicks / detail::ticksPerSecond(speed)) : 0u),
-          fifo(input ? input->channels : 0u, std::max(block * 4u, rate / 100u)),
+          fifo(input ? input->channels : 0u,
+               std::max({block * 4u, rate / 100u, inputPreroll * 2u})),
           inputBlock(input ? input->channels * block : 0u), outputBlock(output.channels * block),
+          lastOutput(output.channels),
           outputClock(rate, speed, output.data.intervalTicks) {
         const auto enqueue = [&](Transfer::Kind kind, const Endpoint& endpoint, unsigned count) {
             for (unsigned i = 0; i < count; ++i)
@@ -135,12 +139,17 @@ struct Streaming {
     void* context;
     unsigned blockFrames;
     unsigned outputCursor;
+    const unsigned fadeFrames;
     unsigned inputPreroll;
     bool renderStarted = false;
+    bool captureOverflow = false;
+    unsigned fadeOutRemaining = 0;
+    unsigned fadeInRemaining = 0;
     std::uint64_t lastCaptureAt = 0;
     InputFifo fifo;
     std::vector<float> inputBlock;
     std::vector<float> outputBlock;
+    std::vector<float> lastOutput;
     detail::PacketClock outputClock;
     std::vector<std::unique_ptr<Transfer>> transfers;
 };
@@ -173,6 +182,7 @@ struct Device::Impl {
     std::atomic<std::uint64_t> inputOverruns{0};
     std::atomic<std::uint64_t> inputUnderruns{0};
     std::atomic<std::uint64_t> packetErrors{0};
+    std::atomic<std::uint64_t> captureRecoveries{0};
     std::thread worker;
     std::unique_ptr<Streaming> streaming;
 
@@ -396,18 +406,47 @@ struct Device::Impl {
     void render(std::uint8_t* target, unsigned frames, bool prime) noexcept {
         auto& state = *streaming;
         const auto stride = output.frameBytes();
-        if (prime || (!state.renderStarted && input && state.fifo.size() < state.inputPreroll)) {
+        if (prime) {
             std::fill_n(target, frames * stride, std::uint8_t{0});
             return;
         }
-        state.renderStarted = true;
 
         while (frames > 0) {
             if (state.outputCursor == state.blockFrames) {
                 if (input) {
-                    const auto copied = state.fifo.pop(state.inputBlock.data(), state.blockFrames);
-                    if (copied != state.blockFrames)
-                        inputUnderruns.fetch_add(state.blockFrames - copied, std::memory_order_relaxed);
+                    const auto available = state.fifo.size();
+                    if (state.renderStarted && (state.captureOverflow || available < state.blockFrames)) {
+                        if (available < state.blockFrames)
+                            inputUnderruns.fetch_add(state.blockFrames - available, std::memory_order_relaxed);
+                        captureRecoveries.fetch_add(1, std::memory_order_relaxed);
+                        state.renderStarted = false;
+                        state.fadeOutRemaining = state.fadeFrames;
+                    }
+                    if (state.fadeOutRemaining > 0) {
+                        const auto count = std::min(frames, state.fadeOutRemaining);
+                        for (unsigned frame = 0; frame < count; ++frame) {
+                            const auto gain = static_cast<float>(--state.fadeOutRemaining) / state.fadeFrames;
+                            for (unsigned channel = 0; channel < output.channels; ++channel)
+                                detail::packPcm(state.lastOutput[channel] * gain,
+                                    target + frame * stride + channel * output.slotBytes,
+                                    output.slotBytes, output.sampleBits);
+                        }
+                        target += count * stride;
+                        frames -= count;
+                        continue;
+                    }
+                    if (!state.renderStarted) {
+                        if (available < state.inputPreroll) {
+                            std::fill_n(target, frames * stride, std::uint8_t{0});
+                            return;
+                        }
+                        if (state.captureOverflow)
+                            state.fifo.discard(available - state.inputPreroll);
+                        state.captureOverflow = false;
+                        state.renderStarted = true;
+                        state.fadeInRemaining = state.fadeFrames;
+                    }
+                    state.fifo.pop(state.inputBlock.data(), state.blockFrames);
                 }
                 std::fill(state.outputBlock.begin(), state.outputBlock.end(), 0.0f);
                 state.callback(state.context, input ? state.inputBlock.data() : nullptr,
@@ -416,8 +455,17 @@ struct Device::Impl {
             }
             const auto count = std::min(frames, state.blockFrames - state.outputCursor);
             const auto* samples = state.outputBlock.data() + state.outputCursor * output.channels;
-            for (unsigned i = 0; i < count * output.channels; ++i)
-                detail::packPcm(samples[i], target + i * output.slotBytes, output.slotBytes, output.sampleBits);
+            for (unsigned frame = 0; frame < count; ++frame) {
+                const float gain = state.fadeInRemaining > 0
+                    ? 1.0f - static_cast<float>(--state.fadeInRemaining) / state.fadeFrames : 1.0f;
+                for (unsigned channel = 0; channel < output.channels; ++channel) {
+                    const auto index = frame * output.channels + channel;
+                    const auto sample = samples[index] * gain;
+                    state.lastOutput[channel] = sample;
+                    detail::packPcm(sample, target + index * output.slotBytes,
+                                    output.slotBytes, output.sampleBits);
+                }
+            }
             state.outputCursor += count;
             frames -= count;
             target += count * stride;
@@ -474,8 +522,10 @@ struct Device::Impl {
                     continue;
                 }
                 for (unsigned start = 0; start < packet.actual_length; start += stride) {
-                    if (streaming->fifo.push(data + start, input->slotBytes))
+                    if (streaming->fifo.push(data + start, input->slotBytes)) {
                         inputOverruns.fetch_add(1, std::memory_order_relaxed);
+                        streaming->captureOverflow = true;
+                    }
                 }
                 if (packet.actual_length != 0)
                     streaming->lastCaptureAt = completedFrames.load(std::memory_order_relaxed);
@@ -576,6 +626,7 @@ struct Device::Impl {
         inputOverruns.store(0, std::memory_order_relaxed);
         inputUnderruns.store(0, std::memory_order_relaxed);
         packetErrors.store(0, std::memory_order_relaxed);
+        captureRecoveries.store(0, std::memory_order_relaxed);
         stopRequested.store(false, std::memory_order_release);
         wake = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
         if (wake < 0)
@@ -682,7 +733,8 @@ bool Device::isRunning() const noexcept { return impl_->running.load(std::memory
 
 Statistics Device::statistics() const noexcept {
     return {impl_->completedFrames.load(std::memory_order_relaxed), impl_->inputOverruns.load(std::memory_order_relaxed),
-            impl_->inputUnderruns.load(std::memory_order_relaxed), impl_->packetErrors.load(std::memory_order_relaxed)};
+            impl_->inputUnderruns.load(std::memory_order_relaxed), impl_->packetErrors.load(std::memory_order_relaxed),
+            impl_->captureRecoveries.load(std::memory_order_relaxed)};
 }
 
 std::string Device::lastError() const { return impl_->lastError(); }

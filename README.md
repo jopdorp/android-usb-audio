@@ -42,7 +42,7 @@ device.close();
 // Then close UsbDeviceConnection on Android.
 ```
 
-The `AudioCallback` must be nonblocking and receives `nullptr` input for a playback-only connection. Stop and close wait for the callback thread and cancel outstanding USB transfers. For status displays, use `isRunning()`, `lastError()` and `statistics()`. The latter reports completed output frames, input frames lost to overflow, missing input frames filled with silence, and transfer or packet errors. A failed open or start returns an error, allowing the app to use its normal Android audio backend.
+The `AudioCallback` must be nonblocking and receives `nullptr` input for a playback-only connection. Stop and close wait for the callback thread and cancel outstanding USB transfers. If capture falls behind or overruns, output fades to silence while the capture queue refills, then fades back in. USB transfers stay queued and the DSP callback resumes with a complete input block. Persistent capture loss is reported as a stream failure. For status displays, use `isRunning()`, `lastError()` and `statistics()`. The counters include completed output frames, input overflow and missing frames, USB errors, and capture recoveries. A failed open or start returns an error, allowing the app to use its normal Android audio backend.
 
 ## Verification
 

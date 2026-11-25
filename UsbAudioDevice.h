@@ -18,6 +18,7 @@ struct Statistics {
     std::uint64_t inputOverruns = 0;
     std::uint64_t inputUnderruns = 0;
     std::uint64_t packetErrors = 0;
+    std::uint64_t captureRecoveries = 0;
 };
 
 using AudioCallback = void (*)(void* context, const float* inputInterleaved,

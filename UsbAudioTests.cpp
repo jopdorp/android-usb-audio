@@ -193,8 +193,14 @@ struct MockUsb {
     unsigned discarded = 0;
     unsigned rate = 44100;
     unsigned capturedPackets = 0;
+    unsigned gapStart = 0;
+    unsigned gapEnd = 0;
     unsigned sevenFramePackets = 0;
     bool playedCallbackOutput = false;
+    float lastOutputSample = 0.0f;
+    float largestOutputJump = 0.0f;
+    bool quietAfterAudio = false;
+    bool audioResumed = false;
 
     int control(usbdevfs_ctrltransfer& req) {
         auto* data = static_cast<std::uint8_t*>(req.data);
@@ -237,15 +243,27 @@ struct MockUsb {
             case 0x01: // PCM OUT, 2 channels in 4-byte slots
                 packet.actual_length = packet.length;
                 sevenFramePackets += packet.length == 56;
-                for (unsigned j = 0; j < packet.length; j += 4)
-                    playedCallbackOutput |= bytes[j + 3] == 0x10;
+                for (unsigned j = 0; j < packet.length; j += 8) {
+                    const float sample = unpackPcm(bytes + j, 4);
+                    largestOutputJump = std::max(largestOutputJump, std::abs(sample - lastOutputSample));
+                    lastOutputSample = sample;
+                    if (playedCallbackOutput && sample == 0.0f)
+                        quietAfterAudio = true;
+                    if (sample == 0.125f) {
+                        playedCallbackOutput = true;
+                        audioResumed |= quietAfterAudio;
+                    }
+                }
                 break;
             case 0x81: // 6.015625 sample frames per microframe, as 16.16
                 std::copy_n(std::array<std::uint8_t, 4>{0, 0x04, 6, 0}.begin(), 4, bytes);
                 packet.actual_length = 4;
                 break;
             case 0x82: // PCM IN, 2 channels in 3-byte slots
-                packet.actual_length = (++capturedPackets % 64 == 0 ? 7u : 6u) * 6u;
+                ++capturedPackets;
+                packet.actual_length = (capturedPackets % 64 == 0 ? 7u : 6u) * 6u;
+                if (capturedPackets >= gapStart && capturedPackets < gapEnd)
+                    packet.actual_length = 0;
                 for (unsigned j = 0; j < packet.actual_length; j += 3) {
                     bytes[j] = bytes[j + 1] = 0;
                     bytes[j + 2] = 0x20;
@@ -261,13 +279,14 @@ MockUsb* mock = nullptr;
 
 struct CallbackProbe {
     bool expectsInput = true;
+    unsigned blockFrames = 64;
     std::atomic<unsigned> calls{0};
     std::atomic<bool> heardInput{false};
     std::atomic<bool> badBlock{false};
 
     static void process(void* self, const float* input, float* output, unsigned frames) noexcept {
         auto& probe = *static_cast<CallbackProbe*>(self);
-        if ((input != nullptr) != probe.expectsInput || frames != 64)
+        if ((input != nullptr) != probe.expectsInput || frames != probe.blockFrames)
             probe.badBlock = true;
         else if (input && input[0] == 0.25f && input[1] == 0.25f)
             probe.heardInput = true;
@@ -327,6 +346,44 @@ void testUsbfsWorker() {
     device.close();
     check(playbackOnly.calls >= 10 && !playbackOnly.badBlock, "Playback-only callback receives null input");
     check(::fcntl(fd, F_GETFD) >= 0, "Close must not close the caller's descriptor");
+    ::close(fd);
+    mock = nullptr;
+}
+
+void testCaptureRecovery(unsigned blockFrames, bool interruptCapture) {
+    MockUsb usb;
+    if (interruptCapture) {
+        usb.gapStart = 480;
+        usb.gapEnd = 576;
+    }
+    mock = &usb;
+    const auto fd = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+    check(fd >= 0, "Recovery test fd");
+
+    Device device;
+    check(device.open(fd, uac2(true)), "Open duplex for the recovery test");
+    CallbackProbe probe{true, blockFrames};
+    check(device.start(blockFrames, CallbackProbe::process, &probe), "Start selected block size");
+    waitForCallbacks(probe, 100);
+    const auto isStillRunning = device.isRunning();
+    device.close();
+    const auto stats = device.statistics();
+
+    check(isStillRunning && probe.calls >= 100 && !probe.badBlock && probe.heardInput,
+          "Duplex remains live with the exact selected callback size");
+    check(stats.completedFrames > 4800 && stats.packetErrors == 0, "Audio continues to USB without transfer errors");
+    if (interruptCapture) {
+        check(stats.captureRecoveries == 1 && stats.inputUnderruns > 0 && stats.inputOverruns == 0,
+              "One brief capture loss triggers one recovery");
+        check(usb.quietAfterAudio && usb.audioResumed && usb.largestOutputJump < 0.02f,
+              "Capture loss fades out to silence, then fades back without an output step");
+    } else {
+        if (stats.captureRecoveries || stats.inputUnderruns || stats.inputOverruns)
+            std::cerr << blockFrames << " frames: " << stats.captureRecoveries << " recoveries, "
+                      << stats.inputUnderruns << " missing, " << stats.inputOverruns << " dropped\n";
+        check(stats.captureRecoveries == 0 && stats.inputUnderruns == 0 && stats.inputOverruns == 0,
+              "Healthy shared-clock streaming does not trigger the recovery path");
+    }
     ::close(fd);
     mock = nullptr;
 }
@@ -406,5 +463,9 @@ int main() {
     testOpenFailure();
 #if defined(ANDROID_USB_AUDIO_TEST_USBFS)
     testUsbfsWorker();
+    for (const auto blockFrames : {64u, 128u}) {
+        testCaptureRecovery(blockFrames, false);
+        testCaptureRecovery(blockFrames, true);
+    }
 #endif
 }
