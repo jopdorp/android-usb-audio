@@ -19,14 +19,17 @@ struct Statistics {
     std::uint64_t inputUnderruns = 0;
     std::uint64_t packetErrors = 0;
     std::uint64_t captureRecoveries = 0;
+    std::uint64_t playbackRecoveries = 0;
+    int usbNice = 0;
+    int dspNice = 0;
 };
 
 using AudioCallback = void (*)(void* context, const float* inputInterleaved,
                                float* outputInterleaved, unsigned frames) noexcept;
 
 // Direct USB audio using an fd obtained with Android's USB Host permission.
-// Call lifecycle methods from one control thread. The callback is invoked on
-// a worker and must not block, allocate, or call a lifecycle method. Input is
+// Call lifecycle methods from one control thread. The callback runs on a DSP
+// thread and must not block, allocate, or call a lifecycle method. Input is
 // null for playback-only devices. Both arrays are valid only until the callback
 // returns. The output buffer is zeroed before every callback.
 class Device {

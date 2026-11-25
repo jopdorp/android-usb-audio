@@ -10,6 +10,7 @@
 #include <limits>
 #include <string_view>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #if defined(ANDROID_USB_AUDIO_TEST_USBFS)
@@ -290,12 +291,22 @@ MockUsb* mock = nullptr;
 struct CallbackProbe {
     bool expectsInput = true;
     unsigned blockFrames = 64;
+    unsigned pauseAfter = 0;
+    unsigned microsPerFrame = 0;
     std::atomic<unsigned> calls{0};
     std::atomic<bool> heardInput{false};
     std::atomic<bool> badBlock{false};
+    std::atomic<bool> paused{false};
+    std::atomic<bool> resume{false};
 
     static void process(void* self, const float* input, float* output, unsigned frames) noexcept {
         auto& probe = *static_cast<CallbackProbe*>(self);
+        if (probe.pauseAfter != 0 && probe.calls.load() == probe.pauseAfter) {
+            probe.paused = true;
+            probe.resume.wait(false);
+        }
+        if (probe.microsPerFrame != 0)
+            std::this_thread::sleep_for(std::chrono::microseconds(probe.microsPerFrame * frames));
         if ((input != nullptr) != probe.expectsInput || frames != probe.blockFrames)
             probe.badBlock = true;
         else if (input && input[0] == 0.25f && input[1] == 0.25f)
@@ -305,10 +316,16 @@ struct CallbackProbe {
     }
 };
 
-void waitForCallbacks(const CallbackProbe& probe, unsigned calls) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (probe.calls < calls && std::chrono::steady_clock::now() < deadline)
+template<class Predicate>
+bool waitFor(Predicate condition, std::chrono::milliseconds timeout = std::chrono::seconds(2)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!condition() && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    return condition();
+}
+
+void waitForCallbacks(const CallbackProbe& probe, unsigned calls) {
+    check(waitFor([&] { return probe.calls >= calls; }), "Timed out waiting for DSP callbacks");
 }
 
 void testUsbfsWorker() {
@@ -364,7 +381,7 @@ void testCaptureRecovery(unsigned blockFrames, bool interruptCapture) {
     MockUsb usb;
     if (interruptCapture) {
         usb.gapStart = 480;
-        usb.gapEnd = 576;
+        usb.gapEnd = usb.gapStart + (blockFrames >= 384 ? 192 : 96);
     }
     mock = &usb;
     const auto fd = ::open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -374,12 +391,12 @@ void testCaptureRecovery(unsigned blockFrames, bool interruptCapture) {
     check(device.open(fd, uac2(true)), "Open duplex for the recovery test");
     CallbackProbe probe{true, blockFrames};
     check(device.start(blockFrames, CallbackProbe::process, &probe), "Start selected block size");
-    waitForCallbacks(probe, 100);
+    waitForCallbacks(probe, std::max(30u, 6000u / blockFrames));
     const auto isStillRunning = device.isRunning();
     device.close();
     const auto stats = device.statistics();
 
-    check(isStillRunning && probe.calls >= 100 && !probe.badBlock && probe.heardInput,
+    check(isStillRunning && !probe.badBlock && probe.heardInput,
           "Duplex remains live with the exact selected callback size");
     check(stats.completedFrames > 4800 && stats.packetErrors == 0, "Audio continues to USB without transfer errors");
     if (interruptCapture) {
@@ -394,6 +411,53 @@ void testCaptureRecovery(unsigned blockFrames, bool interruptCapture) {
         check(stats.captureRecoveries == 0 && stats.inputUnderruns == 0 && stats.inputOverruns == 0,
               "Healthy shared-clock streaming does not trigger the recovery path");
     }
+    ::close(fd);
+    mock = nullptr;
+}
+
+void testUsbContinuesWithBlockedDsp(unsigned blockFrames) {
+    MockUsb usb;
+    mock = &usb;
+    const auto fd = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+    check(fd >= 0, "Transport test fd");
+    Device device;
+    check(device.open(fd, uac2(true, false)), "Open playback for the DSP stall test");
+    CallbackProbe probe{false, blockFrames, 5};
+    check(device.start(blockFrames, CallbackProbe::process, &probe), "Start playback for the DSP stall test");
+    const bool enteredDsp = waitFor([&] { return probe.paused.load(); });
+    const auto framesBefore = device.statistics().completedFrames;
+    const auto advanced = waitFor([&] { return device.statistics().completedFrames >= framesBefore + 4 * blockFrames; },
+                                  std::chrono::milliseconds(250));
+    const auto stalledStats = device.statistics();
+    probe.resume = true;
+    probe.resume.notify_one();
+    check(enteredDsp && advanced && probe.calls >= 5,
+          "USB playback transfers must continue while DSP is blocked");
+    check(stalledStats.playbackRecoveries == 1 && stalledStats.captureRecoveries == 0,
+          "A blocked callback is reported as one playback recovery");
+    waitForCallbacks(probe, 12);
+    device.close();
+    check(usb.quietAfterAudio && usb.audioResumed && usb.largestOutputJump < 0.02f,
+          "Playback fades out during DSP starvation and fades back in after it resumes");
+    ::close(fd);
+    mock = nullptr;
+}
+
+void testDuplexWithExpensiveDsp(unsigned blockFrames) {
+    MockUsb usb;
+    mock = &usb;
+    const auto fd = ::open("/dev/null", O_RDWR | O_CLOEXEC);
+    check(fd >= 0, "Transport test fd");
+    Device device;
+    check(device.open(fd, uac2(true)), "Open duplex for the DSP timing test");
+    CallbackProbe probe{true, blockFrames, 0, 9};
+    check(device.start(blockFrames, CallbackProbe::process, &probe), "Start duplex for the DSP timing test");
+    waitForCallbacks(probe, 30);
+    device.close();
+    const auto stats = device.statistics();
+    check(stats.playbackRecoveries == 0 && stats.captureRecoveries == 0 && stats.packetErrors == 0 &&
+          usb.playedCallbackOutput && !usb.quietAfterAudio && !probe.badBlock,
+          "Duplex stays continuous when a DSP block exceeds the USB refill interval");
     ::close(fd);
     mock = nullptr;
 }
@@ -455,12 +519,18 @@ extern "C" int __wrap_ioctl(int, unsigned long request, ...) {
 extern "C" int __wrap_poll(pollfd* descriptors, nfds_t count, int) {
     if (!mock || count != 2)
         return MockUsb::error(EINVAL);
-    std::this_thread::sleep_for(std::chrono::microseconds(100));
-    for (auto* transfer : mock->pending) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::array<bool, 256> completedEndpoints{};
+    for (auto it = mock->pending.begin(); it != mock->pending.end();) {
+        auto* transfer = *it;
+        if (std::exchange(completedEndpoints[transfer->endpoint], true)) {
+            ++it;
+            continue;
+        }
         mock->complete(*transfer);
         mock->completed.push_back(transfer);
+        it = mock->pending.erase(it);
     }
-    mock->pending.clear();
     descriptors[0].revents = POLLOUT;
     return 1;
 }
@@ -473,9 +543,13 @@ int main() {
     testOpenFailure();
 #if defined(ANDROID_USB_AUDIO_TEST_USBFS)
     testUsbfsWorker();
-    for (const auto blockFrames : {64u, 128u}) {
+    for (const auto blockFrames : {64u, 96u, 128u, 192u, 256u, 384u, 512u}) {
         testCaptureRecovery(blockFrames, false);
         testCaptureRecovery(blockFrames, true);
+    }
+    for (const auto blockFrames : {256u, 512u}) {
+        testDuplexWithExpensiveDsp(blockFrames);
+        testUsbContinuesWithBlockedDsp(blockFrames);
     }
 #endif
 }

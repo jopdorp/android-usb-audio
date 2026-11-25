@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <linux/usb/ch9.h>
 #include <linux/usbdevice_fs.h>
+#include <limits>
 #include <poll.h>
 #include <pthread.h>
 #include <sys/eventfd.h>
@@ -113,17 +114,29 @@ private:
 };
 
 struct Streaming {
+    struct Block {
+        std::vector<float> input;
+        std::vector<float> output;
+    };
+
+    static constexpr auto stopDsp = std::numeric_limits<std::uint64_t>::max();
+
     Streaming(const Stream& output, const std::optional<Stream>& input,
               Speed speed, unsigned rate, unsigned block, AudioCallback callback, void* context)
         : callback(callback), context(context), blockFrames(block), outputCursor(block),
           fadeFrames(std::max(1u, rate / 1500u)),
-          inputPreroll(input ? block + streamQueueDepth * std::max(rate / 1000u,
-              rate * input->data.intervalTicks / detail::ticksPerSecond(speed)) : 0u),
+          playbackLead(std::max(block, streamQueueDepth * std::max(rate / 1000u,
+              rate * output.data.intervalTicks / detail::ticksPerSecond(speed)))), leadRemaining(playbackLead),
           fifo(input ? input->channels : 0u,
-               std::max({block * 4u, rate / 100u, inputPreroll * 2u})),
-          inputBlock(input ? input->channels * block : 0u), outputBlock(output.channels * block),
+               std::max({block * 4u, rate / 100u, (block + playbackLead) * 2u})),
+          blocks((playbackLead + block - 1u) / block + 2u),
           lastOutput(output.channels),
           outputClock(rate, speed, output.data.intervalTicks) {
+        for (auto& item : blocks) {
+            if (input)
+                item.input.resize(input->channels * block);
+            item.output.resize(output.channels * block);
+        }
         const auto enqueue = [&](Transfer::Kind kind, const Endpoint& endpoint, unsigned count) {
             for (unsigned i = 0; i < count; ++i)
                 transfers.push_back(std::make_unique<Transfer>(kind, endpoint, speed));
@@ -135,20 +148,63 @@ struct Streaming {
         enqueue(Transfer::Kind::output, output.data, streamQueueDepth);
     }
 
+    Block& block(std::uint64_t index) noexcept { return blocks[index % blocks.size()]; }
+
+    void queueDsp(bool hasInput) noexcept {
+        if (captureOverflow)
+            return;
+        const auto previous = queued;
+        while (queued - played < blocks.size() && (hasInput ? fifo.size() >= blockFrames : queued - played < 2u)) {
+            if (hasInput)
+                fifo.pop(block(queued).input.data(), blockFrames);
+            ++queued;
+        }
+        if (queued != previous) {
+            requested.store(queued, std::memory_order_release);
+            requested.notify_one();
+        }
+    }
+
+    void runDsp(std::atomic<int>& nice) noexcept {
+        pthread_setname_np(pthread_self(), "USB audio DSP");
+        ::setpriority(PRIO_PROCESS, 0, -10);
+        nice.store(::getpriority(PRIO_PROCESS, 0), std::memory_order_relaxed);
+        for (std::uint64_t next = 0;; ++next) {
+            requested.wait(next, std::memory_order_acquire);
+            if (requested.load(std::memory_order_acquire) == stopDsp)
+                return;
+            auto& item = block(next);
+            std::fill(item.output.begin(), item.output.end(), 0.0f);
+            callback(context, item.input.empty() ? nullptr : item.input.data(), item.output.data(), blockFrames);
+            ready.store(next + 1u, std::memory_order_release);
+        }
+    }
+
+    void stopProcessing() noexcept {
+        requested.store(stopDsp, std::memory_order_release);
+        requested.notify_one();
+    }
+
     AudioCallback callback;
     void* context;
-    unsigned blockFrames;
+    const unsigned blockFrames;
     unsigned outputCursor;
     const unsigned fadeFrames;
-    unsigned inputPreroll;
+    const unsigned playbackLead;
+    unsigned leadRemaining;
     bool renderStarted = false;
     bool captureOverflow = false;
     unsigned fadeOutRemaining = 0;
     unsigned fadeInRemaining = 0;
     std::uint64_t lastCaptureAt = 0;
     InputFifo fifo;
-    std::vector<float> inputBlock;
-    std::vector<float> outputBlock;
+    // USB owns queue and playback cursors. The DSP thread advances ready after writing a block.
+    std::vector<Block> blocks;
+    std::uint64_t queued = 0;
+    std::uint64_t played = 0;
+    std::uint64_t discardBefore = 0;
+    std::atomic<std::uint64_t> requested{0};
+    std::atomic<std::uint64_t> ready{0};
     std::vector<float> lastOutput;
     detail::PacketClock outputClock;
     std::vector<std::unique_ptr<Transfer>> transfers;
@@ -183,7 +239,11 @@ struct Device::Impl {
     std::atomic<std::uint64_t> inputUnderruns{0};
     std::atomic<std::uint64_t> packetErrors{0};
     std::atomic<std::uint64_t> captureRecoveries{0};
+    std::atomic<std::uint64_t> playbackRecoveries{0};
+    std::atomic<int> usbNice{0};
+    std::atomic<int> dspNice{0};
     std::thread worker;
+    std::thread dspWorker;
     std::unique_ptr<Streaming> streaming;
 
     bool fail(const char* message, int error = 0) {
@@ -413,48 +473,66 @@ struct Device::Impl {
 
         while (frames > 0) {
             if (state.outputCursor == state.blockFrames) {
-                if (input) {
-                    const auto available = state.fifo.size();
-                    if (state.renderStarted && (state.captureOverflow || available < state.blockFrames)) {
-                        if (available < state.blockFrames)
-                            inputUnderruns.fetch_add(state.blockFrames - available, std::memory_order_relaxed);
+                if (state.captureOverflow) {
+                    if (state.renderStarted) {
                         captureRecoveries.fetch_add(1, std::memory_order_relaxed);
                         state.renderStarted = false;
                         state.fadeOutRemaining = state.fadeFrames;
                     }
-                    if (state.fadeOutRemaining > 0) {
-                        const auto count = std::min(frames, state.fadeOutRemaining);
-                        for (unsigned frame = 0; frame < count; ++frame) {
-                            const auto gain = static_cast<float>(--state.fadeOutRemaining) / state.fadeFrames;
-                            for (unsigned channel = 0; channel < output.channels; ++channel)
-                                detail::packPcm(state.lastOutput[channel] * gain,
-                                    target + frame * stride + channel * output.slotBytes,
-                                    output.slotBytes, output.sampleBits);
-                        }
-                        target += count * stride;
-                        frames -= count;
-                        continue;
-                    }
-                    if (!state.renderStarted) {
-                        if (available < state.inputPreroll) {
-                            std::fill_n(target, frames * stride, std::uint8_t{0});
-                            return;
-                        }
-                        if (state.captureOverflow)
-                            state.fifo.discard(available - state.inputPreroll);
-                        state.captureOverflow = false;
-                        state.renderStarted = true;
-                        state.fadeInRemaining = state.fadeFrames;
-                    }
-                    state.fifo.pop(state.inputBlock.data(), state.blockFrames);
+                    state.discardBefore = state.queued;
+                    state.fifo.discard(state.fifo.size() - state.blockFrames);
+                    state.captureOverflow = false;
+                    state.leadRemaining = state.playbackLead;
                 }
-                std::fill(state.outputBlock.begin(), state.outputBlock.end(), 0.0f);
-                state.callback(state.context, input ? state.inputBlock.data() : nullptr,
-                               state.outputBlock.data(), state.blockFrames);
+                if (state.played < state.discardBefore)
+                    state.played = std::min(state.ready.load(std::memory_order_acquire), state.discardBefore);
+                state.queueDsp(input.has_value());
+                const auto readyBlocks = state.ready.load(std::memory_order_acquire);
+
+                if (state.renderStarted && readyBlocks == state.played) {
+                    if (input && state.queued == state.played) {
+                        inputUnderruns.fetch_add(state.blockFrames - state.fifo.size(), std::memory_order_relaxed);
+                        captureRecoveries.fetch_add(1, std::memory_order_relaxed);
+                        state.leadRemaining = state.playbackLead;
+                    } else {
+                        playbackRecoveries.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    state.renderStarted = false;
+                    state.fadeOutRemaining = state.fadeFrames;
+                }
+                if (state.fadeOutRemaining > 0) {
+                    const auto count = std::min(frames, state.fadeOutRemaining);
+                    for (unsigned frame = 0; frame < count; ++frame) {
+                        const auto gain = static_cast<float>(--state.fadeOutRemaining) / state.fadeFrames;
+                        for (unsigned channel = 0; channel < output.channels; ++channel)
+                            detail::packPcm(state.lastOutput[channel] * gain,
+                                target + frame * stride + channel * output.slotBytes,
+                                output.slotBytes, output.sampleBits);
+                    }
+                    target += count * stride;
+                    frames -= count;
+                    continue;
+                }
+                if (state.leadRemaining > 0 && state.queued > std::max(state.played, state.discardBefore)) {
+                    const auto count = std::min(frames, state.leadRemaining);
+                    std::fill_n(target, count * stride, std::uint8_t{0});
+                    state.leadRemaining -= count;
+                    target += count * stride;
+                    frames -= count;
+                    continue;
+                }
+                if (state.played < state.discardBefore || readyBlocks == state.played) {
+                    std::fill_n(target, frames * stride, std::uint8_t{0});
+                    return;
+                }
+                if (!state.renderStarted) {
+                    state.renderStarted = true;
+                    state.fadeInRemaining = state.fadeFrames;
+                }
                 state.outputCursor = 0;
             }
             const auto count = std::min(frames, state.blockFrames - state.outputCursor);
-            const auto* samples = state.outputBlock.data() + state.outputCursor * output.channels;
+            const auto* samples = state.block(state.played).output.data() + state.outputCursor * output.channels;
             for (unsigned frame = 0; frame < count; ++frame) {
                 const float gain = state.fadeInRemaining > 0
                     ? 1.0f - static_cast<float>(--state.fadeInRemaining) / state.fadeFrames : 1.0f;
@@ -467,6 +545,8 @@ struct Device::Impl {
                 }
             }
             state.outputCursor += count;
+            if (state.outputCursor == state.blockFrames)
+                ++state.played;
             frames -= count;
             target += count * stride;
         }
@@ -561,6 +641,7 @@ struct Device::Impl {
     WorkerError run() noexcept {
         pthread_setname_np(pthread_self(), "USB audio");
         ::setpriority(PRIO_PROCESS, 0, -16); // Best effort on Android; the kernel may deny it.
+        usbNice.store(::getpriority(PRIO_PROCESS, 0), std::memory_order_relaxed);
         std::array<pollfd, 2> descriptors{{{fd, POLLOUT, 0}, {wake, POLLIN, 0}}};
 
         while (!stopRequested.load(std::memory_order_acquire)) {
@@ -605,6 +686,7 @@ struct Device::Impl {
                 else if (!submit(*transfer))
                     return errno == ENODEV ? WorkerError::disconnected : WorkerError::submit;
             }
+            streaming->queueDsp(input.has_value());
             for (unsigned i = 0; i < playbackCount && !stopRequested.load(std::memory_order_acquire); ++i) {
                 if (!submit(*playback[i]))
                     return errno == ENODEV ? WorkerError::disconnected : WorkerError::submit;
@@ -627,6 +709,9 @@ struct Device::Impl {
         inputUnderruns.store(0, std::memory_order_relaxed);
         packetErrors.store(0, std::memory_order_relaxed);
         captureRecoveries.store(0, std::memory_order_relaxed);
+        playbackRecoveries.store(0, std::memory_order_relaxed);
+        usbNice.store(0, std::memory_order_relaxed);
+        dspNice.store(0, std::memory_order_relaxed);
         stopRequested.store(false, std::memory_order_release);
         wake = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
         if (wake < 0)
@@ -641,10 +726,12 @@ struct Device::Impl {
                     return fail("Could not submit the initial USB audio transfers", error);
                 }
             }
+            dspWorker = std::thread([this] { streaming->runDsp(dspNice); });
             running.store(true, std::memory_order_release);
             worker = std::thread([this] {
                 const auto error = run();
                 workerErrno.store(errno, std::memory_order_relaxed);
+                streaming->stopProcessing();
                 cancelTransfers();
                 workerError.store(error, std::memory_order_release);
                 running.store(false, std::memory_order_release);
@@ -666,6 +753,10 @@ struct Device::Impl {
         }
         if (worker.joinable())
             worker.join();
+        if (dspWorker.joinable()) {
+            streaming->stopProcessing();
+            dspWorker.join();
+        }
         if (wake >= 0) {
             ::close(wake);
             wake = -1;
@@ -734,7 +825,9 @@ bool Device::isRunning() const noexcept { return impl_->running.load(std::memory
 Statistics Device::statistics() const noexcept {
     return {impl_->completedFrames.load(std::memory_order_relaxed), impl_->inputOverruns.load(std::memory_order_relaxed),
             impl_->inputUnderruns.load(std::memory_order_relaxed), impl_->packetErrors.load(std::memory_order_relaxed),
-            impl_->captureRecoveries.load(std::memory_order_relaxed)};
+            impl_->captureRecoveries.load(std::memory_order_relaxed),
+            impl_->playbackRecoveries.load(std::memory_order_relaxed),
+            impl_->usbNice.load(std::memory_order_relaxed), impl_->dspNice.load(std::memory_order_relaxed)};
 }
 
 std::string Device::lastError() const { return impl_->lastError(); }
